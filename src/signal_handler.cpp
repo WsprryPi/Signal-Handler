@@ -31,6 +31,7 @@
 #include "signal_handler.hpp"
 
 // Standard libraries
+#include <cstdlib>
 
 // System Libraries
 #include <pthread.h>
