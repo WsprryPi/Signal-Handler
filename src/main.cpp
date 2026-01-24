@@ -5,7 +5,7 @@
  * This software is distributed under the MIT License. See LICENSE.md for
  * details.
  *
- * Copyright (C) 2025 Lee C. Bussy (@LBussy). All rights reserved.
+ * Copyright © 2025 - 2026 Lee C. Bussy (@LBussy). All rights reserved.
  *
  * @details
  * This example sets up a global signal handler to catch POSIX signals and
