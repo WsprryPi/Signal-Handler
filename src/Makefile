@@ -1,7 +1,7 @@
 # Makefile for building most C++ or C++ and C projects
 
 # C++ Version
-CXXVER := 17
+CXXVER := 20
 # Prefix for tests, "sudo" if required
 SUDO := #sudo
 # Debug tag
