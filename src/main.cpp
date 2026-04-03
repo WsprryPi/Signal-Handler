@@ -20,12 +20,13 @@
 
 #include "signal_handler.hpp"
 
-#include <iostream>
-#include <thread>
-#include <mutex>
+#include <chrono>
 #include <condition_variable>
-#include <vector>
+#include <iostream>
+#include <mutex>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 // -----------------------------------------------------------------------------
 // Global Resources
@@ -63,7 +64,7 @@ void signal_handler(int signum, bool critical = false)
         stop_requested.store(true);
     }
 
-    cv.notify_all(); // Wake up any waiting worker threads.
+    cv.notify_all();
 }
 
 // -----------------------------------------------------------------------------
@@ -77,17 +78,19 @@ void signal_handler(int signum, bool critical = false)
  */
 void worker_thread(int id)
 {
+    (void)id;
+
     std::unique_lock<std::mutex> lock(cv_mutex);
 
     while (!stop_requested.load())
     {
-        // Simulate computation or I/O
-        for (volatile int i = 0; i < 1000000; ++i)
-        {
-            // Intentional no-op to simulate work
-        }
+        lock.unlock();
 
-        // Periodically check for stop condition with timeout
+        // Simulate computation or I/O without a deprecated volatile loop.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        lock.lock();
+
         cv.wait_for(lock, std::chrono::milliseconds(100), []
                     { return stop_requested.load(); });
     }
@@ -104,15 +107,12 @@ void worker_thread(int id)
  */
 int main()
 {
-    // Block signals globally before spawning threads
     block_signals();
 
-    // Set up signal handling
     signalHandler.setCallback(signal_handler);
     signalHandler.start();
     signalHandler.setPriority(SCHED_RR, 10);
 
-    // Launch worker threads to simulate background activity
     std::vector<std::thread> workers;
     const int num_workers = 4;
     for (int i = 0; i < num_workers; ++i)
@@ -120,19 +120,16 @@ int main()
         workers.emplace_back(worker_thread, i);
     }
 
-    // Wait until a stop is requested via signal
     {
         std::unique_lock<std::mutex> lock(cv_mutex);
         cv.wait(lock, []
                 { return stop_requested.load(); });
     }
 
-    // Shut down the signal handler
     signalHandler.stop();
 
     std::cout << "Waiting for worker threads to finish." << std::endl;
 
-    // Join all worker threads
     for (auto &worker : workers)
     {
         worker.join();
