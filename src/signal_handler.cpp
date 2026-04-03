@@ -1,7 +1,6 @@
 /**
- * @file signal_handler.hpp
- * @brief A C++ class to intercept common signals and use a callback to take
- *        deliberate actions.
+ * @file signal_handler.cpp
+ * @brief Signal handler implementation for dedicated-thread signal processing.
  *
  * This software is distributed under the MIT License. See LICENSE.md for
  * details.
@@ -32,6 +31,7 @@
 
 // Standard libraries
 #include <cstdlib>
+#include <iostream>
 
 // System Libraries
 #include <pthread.h>
@@ -41,33 +41,17 @@
 #include <unistd.h>
 
 #ifdef DEBUG_SIGNAL_HANDLER
-#include <iostream> // Debug printing
 #include <cstring>  // For strerror()
 #endif
 
 /**
- * @brief Mapping of signals to their names and fatality flags.
+ * @brief Mapping of handled signals to display names and immediacy flags.
  *
- * This static unordered_map holds a mapping between signal numbers (keys) and a pair containing:
- * - A textual representation of the signal name.
- * - A boolean flag indicating whether the signal is considered fatal (true) or non-fatal (false).
- *
- * The mapping includes the following signals:
- * - SIGUSR1: User-defined signal 1 (non-fatal).
- * - SIGINT: Interrupt from keyboard (non-fatal).
- * - SIGTERM: Termination signal (non-fatal).
- * - SIGQUIT: Quit from keyboard (non-fatal).
- * - SIGHUP: Hangup detected on controlling terminal (non-fatal).
- * - SIGSEGV: Invalid memory reference (fatal).
- * - SIGBUS: Bus error (fatal).
- * - SIGFPE: Floating-point exception (fatal).
- * - SIGILL: Illegal instruction (fatal).
- * - SIGABRT: Abort signal (fatal).
- *
- * @note This map is a static member of the SignalHandler class.
+ * SIGUSR1 is included so stop() can wake sigwaitinfo() without installing a
+ * separate shutdown primitive.
  */
 const std::unordered_map<int, std::pair<std::string_view, bool>> SignalHandler::signal_map = {
-    //{SIGUSR1, {"SIGUSR1", false}},
+    {SIGUSR1, {"SIGUSR1", false}},
     {SIGINT, {"SIGINT", false}},
     {SIGTERM, {"SIGTERM", false}},
     {SIGQUIT, {"SIGQUIT", false}},
@@ -80,24 +64,17 @@ const std::unordered_map<int, std::pair<std::string_view, bool>> SignalHandler::
 
 /**
  * @brief Block all signals registered in SignalHandler::signal_map.
- * @details Constructs a signal set by iterating over the signal_map from the
- *          SignalHandler class and blocks all the signals using pthread_sigmask.
  *
- *          This is commonly used in multithreaded environments to delegate
- *          signal handling to a dedicated thread, while blocking signal
- *          delivery to others.
+ * This keeps the handled signals out of arbitrary threads so the dedicated
+ * signal worker can receive them synchronously through sigwaitinfo().
  *
- * @note Only blocks signals listed in SignalHandler::signal_map.
- * @note Requires linking with -pthread.
- *
- * @throws None, but will print an error to stderr if pthread_sigmask fails,
- *         provided DEBUG_SIGNAL_HANDLER is defined.
+ * @throws No exceptions are thrown. Debug builds may report system call
+ *         failures to stderr.
  */
 void block_signals()
 {
     sigset_t blockset;
 
-    // Initialize the signal set to empty
     if (sigemptyset(&blockset) != 0)
     {
 #ifdef DEBUG_SIGNAL_HANDLER
@@ -106,7 +83,6 @@ void block_signals()
         return;
     }
 
-    // Add all signals defined in the SignalHandler's map
     for (const auto &entry : SignalHandler::signal_map)
     {
         if (sigaddset(&blockset, entry.first) != 0)
@@ -114,11 +90,9 @@ void block_signals()
 #ifdef DEBUG_SIGNAL_HANDLER
             perror("sigaddset");
 #endif
-            // Continue attempting to add remaining signals
         }
     }
 
-    // Block the collected signal set for the current thread
     if (pthread_sigmask(SIG_BLOCK, &blockset, nullptr) != 0)
     {
 #ifdef DEBUG_SIGNAL_HANDLER
@@ -128,33 +102,13 @@ void block_signals()
 }
 
 /**
- * @brief Constructs a SignalHandler object and prepares signal handling.
+ * @brief Construct an inactive signal handler.
  *
- * @details
- * Initializes the internal state flags, saves terminal settings,
- * modifies terminal behavior if applicable, constructs the signal set from
- * `signal_map`, and blocks those signals for the current thread. These blocked
- * signals will typically be handled by a dedicated thread.
- *
- * Key behaviors:
- * - Saves the current terminal settings (if possible).
- * - Disables ECHOCTL (so ^C is not echoed as `^C`) if supported.
- * - Constructs a `sigset_t` from `signal_map` entries.
- * - Blocks the signals so they are not delivered to this or future threads
- *   unless explicitly unblocked.
- *
- * @note
- * This constructor assumes it is called early in the program's lifecycle,
- * before other threads are spawned, so that the blocked signals are inherited.
- *
- * @warning
- * If `tcgetattr()` or `tcsetattr()` fails, terminal settings may remain unchanged.
- * If `pthread_sigmask()` fails, signals may not be properly blocked.
+ * Construction leaves the worker stopped. start() performs the signal-set
+ * setup and launches the worker when the surrounding process is ready.
  */
 SignalHandler::SignalHandler()
-    : running(false),
-      stop_requested(false),
-      stopping(false),
+    : state(SignalHandlerState::STOPPED),
       termios_saved(false)
 {
 }
@@ -162,38 +116,38 @@ SignalHandler::SignalHandler()
 /**
  * @brief Starts the signal handling worker thread.
  *
- * @details
- * Launches a new thread that runs the `SignalHandler::run()` method.
- * This thread is responsible for synchronously waiting on the signal set
- * defined in the constructor and responding accordingly.
+ * The signal set is built from signal_map and blocked in the calling thread
+ * before the worker is launched so the worker inherits the correct mask.
  *
- * @note
- * This method should only be called once per instance. Calling it multiple
- * times without joining the previous thread may lead to undefined behavior.
+ * @warning Repeated calls while the worker is already running are ignored.
  */
 void SignalHandler::start()
 {
-    running.store(true);
+    if (state.load() == SignalHandlerState::RUNNING ||
+        state.load() == SignalHandlerState::STOP_REQUESTED)
+    {
+        return;
+    }
 
-    // Save current terminal settings for STDIN (file descriptor 0)
+    state.store(SignalHandlerState::RUNNING);
+
     if (tcgetattr(STDIN_FILENO, &original_termios) == 0)
     {
         termios_saved = true;
 
-        // Make a copy and update it to disable ECHOCTL if available
         termios new_termios = original_termios;
 #ifdef ECHOCTL
-        new_termios.c_lflag &= ~ECHOCTL; // Don't echo control characters
+        new_termios.c_lflag &= ~ECHOCTL;
 #endif
-        tcsetattr(STDIN_FILENO, TCSANOW, &new_termios); // Apply changes immediately
+        tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
     }
 
-    // Initialize the signal set with all signals defined in signal_map
     if (sigemptyset(&signal_set) != 0)
     {
 #ifdef DEBUG_SIGNAL_HANDLER
         perror("sigemptyset");
 #endif
+        state.store(SignalHandlerState::STOPPED);
         return;
     }
 
@@ -204,141 +158,122 @@ void SignalHandler::start()
 #ifdef DEBUG_SIGNAL_HANDLER
             perror("sigaddset");
 #endif
-            // Continue adding the remaining signals
         }
     }
 
-    // Block the assembled signal set for the current thread
     if (pthread_sigmask(SIG_BLOCK, &signal_set, nullptr) != 0)
     {
 #ifdef DEBUG_SIGNAL_HANDLER
         perror("pthread_sigmask");
 #endif
+        state.store(SignalHandlerState::STOPPED);
+        return;
     }
 
-    // Start the signal handling thread explicitly
     worker_thread = std::thread(&SignalHandler::run, this);
 }
 
 /**
- * @brief Destructor for the SignalHandler class.
+ * @brief Destroy the signal handler after stopping the worker thread.
  *
- * @details
- * Ensures proper shutdown of the signal handling thread if the handler is still running.
- * If `running` is false, the thread has already been stopped and nothing is done.
- * Otherwise, `stop()` is called to clean up the worker thread and restore terminal state
- * if necessary.
+ * Destruction enforces orderly shutdown so the worker cannot outlive the
+ * object it accesses.
  *
- * @note
- * Thread-safe since `running` is checked atomically.
- *
- * @warning
- * If `stop()` is not idempotent, calling it from the destructor could cause side effects
- * if it was already called manually.
+ * @warning This must not run on the worker thread because stop() joins it.
  */
 SignalHandler::~SignalHandler()
 {
-    if (!running.load())
-    {
-        // Already stopped — nothing to do
-        return;
-    }
+    const SignalHandlerState current = state.load();
 
-    // Gracefully stop the signal handling thread and perform cleanup
-    stop();
+    if (current == SignalHandlerState::RUNNING ||
+        current == SignalHandlerState::STOP_REQUESTED)
+    {
+        stop();
+    }
 }
 
 /**
- * @brief Sets the user-defined callback for signal handling.
+ * @brief Set the user-defined callback for handled signals.
  *
- * @details
- * Registers a callback function to be invoked when a signal is received and
- * processed by the signal handling thread.
+ * The callback is stored by value and later invoked inline on the signal
+ * worker thread.
  *
- * The callback function must accept two arguments:
- * - `int signal_number`: The signal that was received.
- * - `bool fatal`: Indicates whether the signal is considered fatal according
- *   to the signal map.
- *
- * @param cb The callback function to assign.
- *
- * @note
- * This method should be called before `start()` to ensure the callback is
- * available when signals are received.
+ * @param cb Callback receiving the signal number and immediate flag
  */
 void SignalHandler::setCallback(const std::function<void(int, bool)> &cb)
 {
-    // Store the user-provided signal handler callback
     callback = cb;
 }
 
 /**
  * @brief Converts a signal number to its corresponding name string.
  *
- * @details
- * Looks up the given signal number in the `signal_map` and returns the
- * associated signal name as a `std::string_view`. If the signal is not found
- * in the map, the function returns `"UNKNOWN"`.
- *
- * @param signum The signal number to look up.
- * @return A string view of the signal name, or `"UNKNOWN"` if not found.
+ * @param signum Signal number to look up
+ * @return Signal name, or "UNKNOWN" if the signal is not mapped
  */
 std::string_view SignalHandler::signalToString(int signum)
 {
-    // Attempt to find the signal number in the signal map
     auto it = signal_map.find(signum);
     if (it != signal_map.end())
     {
-        return it->second.first; // Return the signal name
+        return it->second.first;
     }
 
-    // Signal not recognized in the map
     return "UNKNOWN";
 }
 
 /**
  * @brief Stops the signal handling thread and restores terminal state.
  *
- * @details
- * Initiates a graceful shutdown of the signal handling mechanism.
- * If the signal handling thread is running and a stop hasn't already been
- * requested, this function:
- * - Marks `stop_requested` as true.
- * - Sends a dummy signal (SIGUSR1) to interrupt a blocked `sigwait()`.
- * - Joins the worker thread to wait for its completion.
- * - Restores the original terminal settings, if previously modified.
+ * Shutdown always joins the worker before returning. This preserves object
+ * lifetime safety because run() accesses this object directly while active.
  *
- * @return `true` if the stop procedure was initiated and completed,
- *         `false` if the signal handler was already stopped or a stop was already in progress.
+ * @return True if this call performed a clean stop, false if the worker was
+ *         already stopped or shutdown was already in progress
  *
- * @note
- * Thread-safe via atomic flags `running` and `stop_requested`.
- * Designed to be idempotent: calling `stop()` multiple times is safe.
+ * @warning stop() can wait for any in-flight callback to finish because the
+ *          callback runs inline on the worker thread.
  */
 bool SignalHandler::stop()
 {
-    // If already stopped or a stop was requested, do nothing
-    if (!running.load() || stop_requested.load())
+    const SignalHandlerState current = state.load();
+
+    if (current == SignalHandlerState::STOPPED ||
+        current == SignalHandlerState::STOP_REQUESTED)
     {
         return false;
     }
 
-    // Request stop and interrupt the signal-waiting thread
-    stop_requested.store(true);
+    state.store(SignalHandlerState::STOP_REQUESTED);
 
-    // Send a signal from our set to wake up the blocked sigwait in run()
-    pthread_kill(worker_thread.native_handle(), SIGUSR1);
-
-    // Wait for the signal handling thread to finish
     if (worker_thread.joinable())
     {
+        const int retval = pthread_kill(worker_thread.native_handle(), SIGUSR1);
+        if (retval != 0)
+        {
+            std::cerr
+                << "[ERROR] Failed to wake signal handler thread with SIGUSR1. "
+                << "pthread_kill() returned "
+                << retval
+                << ". Joining anyway because returning before thread exit would "
+                   "leave object lifetime unsafe."
+                << std::endl;
+        }
+
         worker_thread.join();
     }
 
-    // Restore terminal settings if they were previously saved
+    state.store(SignalHandlerState::STOPPED);
+
     if (termios_saved)
     {
-        tcsetattr(STDIN_FILENO, TCSANOW, &original_termios);
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &original_termios) != 0)
+        {
+            std::cerr
+                << "[WARN ] Failed to restore terminal settings."
+                << std::endl;
+        }
+        termios_saved = false;
     }
 
     return true;
@@ -347,37 +282,23 @@ bool SignalHandler::stop()
 /**
  * @brief Sets the scheduling policy and priority of the signal handling thread.
  *
- * @details
- * Uses `pthread_setschedparam()` to adjust the real-time scheduling policy and
- * priority of the signal handling worker thread.
+ * This is an optional tuning hook for applications that want signal handling
+ * to remain responsive under load.
  *
- * This function is useful for raising the importance of the signal handling
- * thread under high system load, especially when using `SCHED_FIFO` or
- * `SCHED_RR`.
- *
- * @param schedPolicy The scheduling policy (e.g., `SCHED_FIFO`, `SCHED_RR`, `SCHED_OTHER`).
- * @param priority The thread priority value to assign (depends on policy).
- *
- * @return `true` if the scheduling parameters were successfully applied,
- *         `false` otherwise (e.g., thread not running or `pthread_setschedparam()` failed).
- *
- * @note
- * The caller may require elevated privileges (e.g., CAP_SYS_NICE) to apply real-time priorities.
- * It is the caller's responsibility to ensure the priority value is valid for the given policy.
+ * @param schedPolicy Scheduling policy such as SCHED_FIFO or SCHED_RR
+ * @param priority Priority value for the selected scheduling policy
+ * @return True if the scheduling change succeeded, false otherwise
  */
 bool SignalHandler::setPriority(int schedPolicy, int priority)
 {
-    // Ensure that the worker thread is active and joinable
-    if (!running.load() || !worker_thread.joinable())
+    if (state.load() != SignalHandlerState::RUNNING || !worker_thread.joinable())
     {
         return false;
     }
 
-    // Set up the scheduling parameters
     sched_param sch_params;
     sch_params.sched_priority = priority;
 
-    // Attempt to apply the scheduling policy and priority
     int ret = pthread_setschedparam(worker_thread.native_handle(), schedPolicy, &sch_params);
 
     return (ret == 0);
@@ -386,22 +307,12 @@ bool SignalHandler::setPriority(int schedPolicy, int priority)
 /**
  * @brief Main loop for the signal handling thread.
  *
- * @details
- * Waits synchronously for signals using `sigwaitinfo()` on the configured
- * signal set. For each received signal:
- * - If a callback has been registered via `setCallback()`, it is invoked
- *   with the signal number and its "immediate" flag.
- * - If no callback is set and the signal is marked as "immediate" (fatal),
- *   the process is terminated using `std::exit(EXIT_FAILURE)`.
+ * The worker waits synchronously in sigwaitinfo(), filters the internal
+ * shutdown wake signal, and invokes the callback inline for handled signals.
+ * When STOP_REQUESTED is observed, the loop exits promptly so stop() can join.
  *
- * The loop continues until `stop_requested` is set or `running` is false.
- *
- * @note
- * Signals are blocked in the constructor and unblocked only for this thread.
- * This loop ensures that signals are handled in a centralized and controlled way.
- *
- * @warning
- * This function is designed to be run in a dedicated thread. Do not call directly.
+ * @warning Because the callback runs inline here, any blocking callback work
+ *          directly delays shutdown completion.
  */
 void SignalHandler::run()
 {
@@ -409,13 +320,15 @@ void SignalHandler::run()
     std::cout << "Signal thread running, waiting for signals." << std::endl;
 #endif
 
-    // Build a local signal set from the static signal map
+    SignalHandler *local_this = this;
+
     sigset_t local_set;
     if (sigemptyset(&local_set) != 0)
     {
 #ifdef DEBUG_SIGNAL_HANDLER
         perror("sigemptyset");
 #endif
+        local_this->state.store(SignalHandlerState::STOPPED);
         return;
     }
 
@@ -426,47 +339,57 @@ void SignalHandler::run()
 #ifdef DEBUG_SIGNAL_HANDLER
             perror("sigaddset");
 #endif
-            // Continue building set despite failures
         }
     }
 
-    // Main signal-handling loop
-    while (running.load() && !stop_requested.load())
+    while (true)
     {
-        siginfo_t siginfo;
-        int sig = sigwaitinfo(&local_set, &siginfo);
+        const SignalHandlerState current = local_this->state.load();
 
-        // If shutdown was requested while waiting, exit immediately
-        if (stop_requested.load())
+        if (current != SignalHandlerState::RUNNING &&
+            current != SignalHandlerState::STOP_REQUESTED)
         {
             break;
         }
 
-        // Filter our own wake-up signal (if you left it mapped)
-        if (sig == SIGUSR1)
-            continue;
+        siginfo_t siginfo;
+        int sig = sigwaitinfo(&local_set, &siginfo);
 
-        // Skip any signal not in the map (i.e. UNKNOWN)
+        const SignalHandlerState post_wait_state = local_this->state.load();
+        if (post_wait_state == SignalHandlerState::STOP_REQUESTED)
+        {
+            break;
+        }
+
+        if (post_wait_state != SignalHandlerState::RUNNING)
+        {
+            break;
+        }
+
+        if (sig == SIGUSR1)
+        {
+            continue;
+        }
+
         auto it = signal_map.find(sig);
         if (it == signal_map.end())
+        {
             continue;
+        }
 
-        // Now we know it’s one we really care about.
         bool immediate = it->second.second;
 
-        // Invoke the user callback
-        if (callback)
+        if (local_this->callback)
         {
 #ifdef DEBUG_SIGNAL_HANDLER
             std::cout << "Callback requested for signal: "
                       << SignalHandler::signalToString(sig) << std::endl;
             std::cout << std::flush;
 #endif
-            callback(sig, immediate);
+            local_this->callback(sig, immediate);
         }
         else
         {
-            // No callback provided — exit immediately if signal is fatal
             if (immediate)
             {
                 std::exit(EXIT_FAILURE);
@@ -474,6 +397,8 @@ void SignalHandler::run()
         }
     }
 
-    // Mark the handler as no longer running
-    running.store(false);
+    if (local_this->state.load() == SignalHandlerState::STOP_REQUESTED)
+    {
+        local_this->state.store(SignalHandlerState::STOPPED);
+    }
 }

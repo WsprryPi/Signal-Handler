@@ -1,7 +1,6 @@
 /**
  * @file signal_handler.hpp
- * @brief A C++ class to intercept common signals and use a callback to take
- *        deliberate actions.
+ * @brief Signal handler interface for dedicated-thread signal processing.
  *
  * This software is distributed under the MIT License. See LICENSE.md for
  * details.
@@ -42,110 +41,147 @@
 #include <termios.h>
 
 /**
+ * @brief Lifecycle state of the signal handler worker thread.
+ *
+ * This state tracks whether the dedicated signal-wait thread is active,
+ * draining toward shutdown, or fully stopped.
+ */
+enum class SignalHandlerState
+{
+    RUNNING,        ///< The worker thread is active.
+    STOP_REQUESTED, ///< Shutdown was requested and join is pending.
+    STOPPED         ///< The worker thread has exited.
+};
+
+/**
  * @brief Block all signals registered in SignalHandler::signal_map.
- * @details Constructs a signal set by iterating over the signal_map from the
- *          SignalHandler class and blocks all the signals using pthread_sigmask.
  *
- *          This is commonly used in multithreaded environments to delegate
- *          signal handling to a dedicated thread, while blocking signal
- *          delivery to others.
+ * This helper is intended to be called before worker threads are created so
+ * the blocked mask is inherited and signals are funneled to the dedicated
+ * signal thread.
  *
- * @note Only blocks signals listed in SignalHandler::signal_map.
- * @note Requires linking with -pthread.
- *
- * @throws None, but will print an error to stderr if pthread_sigmask fails,
- *         provided DEBUG_SIGNAL_HANDLER is defined.
+ * @throws No exceptions are thrown. Debug builds may report system call
+ *         failures to stderr.
  */
 void block_signals();
 
 /**
  * @brief Manages signal handling in a multi-threaded environment.
  *
- * @details
- * The SignalHandler class centralizes POSIX signal handling into a dedicated
- * thread, allowing controlled asynchronous signal responses via user-defined
- * callbacks or immediate shutdown behavior.
+ * The handler centralizes selected POSIX signals in one dedicated thread.
+ * That keeps signal delivery predictable across the process and lets the
+ * application react from normal thread context instead of async handlers.
  *
- * Signals are defined via a static `signal_map`, which maps each signal number
- * to a human-readable name and a boolean indicating whether it requires an
- * immediate process termination.
- *
- * Terminal control characters (like ^C) can also be suppressed during the
- * lifetime of the signal handler.
+ * @warning The callback runs inline on the signal worker thread. It must stay
+ *          minimal and return quickly so shutdown via stop() cannot be delayed.
  */
 class SignalHandler
 {
 public:
     /**
-     * @brief Status codes for potential future extension.
+     * @brief Placeholder status values for future expansion.
      */
     enum class Status
     {
         OK,   ///< Operation completed successfully.
-        ERROR ///< Operation failed or invalid.
+        ERROR ///< Operation failed or was invalid.
     };
 
     /**
-     * @brief Constructs the SignalHandler and blocks target signals.
+     * @brief Construct an inactive signal handler.
+     *
+     * Construction does not start the worker thread. Call start() after any
+     * required callback registration is complete.
      */
     SignalHandler();
 
     /**
-     * @brief Destructor that ensures cleanup and thread shutdown.
+     * @brief Destroy the signal handler after stopping the worker thread.
+     *
+     * If the worker thread is still active, destruction requests shutdown and
+     * waits for the worker to exit before object lifetime ends.
+     *
+     * @warning The object must not be destroyed from the worker thread itself,
+     *          because stop() joins that thread during shutdown.
      */
     ~SignalHandler();
 
-    // Delete copy constructor and assignment operator to enforce unique instance
+    /**
+     * @brief Disable copying.
+     *
+     * A handler owns a single worker thread and cannot be copied safely.
+     */
     SignalHandler(const SignalHandler &) = delete;
+
+    /**
+     * @brief Disable copy assignment.
+     *
+     * A handler owns a single worker thread and cannot be copied safely.
+     */
     SignalHandler &operator=(const SignalHandler &) = delete;
 
     /**
      * @brief Starts the signal handling thread.
-     * @details Should be called once to begin waiting for signals.
+     *
+     * This builds the wait set, blocks the configured signals for the current
+     * thread, and launches the dedicated worker thread that waits for them.
+     *
+     * @warning This function is intended to be called once per active worker
+     *          lifetime. Re-entry while already running is ignored.
      */
     void start();
 
     /**
-     * @brief Sets the user-defined callback to handle signals.
+     * @brief Set the callback invoked for handled signals.
      *
-     * @details The callback receives two arguments:
-     * - The signal number received.
-     * - A boolean indicating whether the signal is marked as "immediate".
+     * The callback executes inline on the worker thread after sigwaitinfo()
+     * returns a handled signal.
      *
-     * @param cb A function accepting (int signal_number, bool immediate).
+     * @param cb Function receiving the signal number and whether the signal is
+     *           marked immediate in signal_map
+     *
+     * @warning The callback should perform only minimal non-blocking work, such
+     *          as setting flags or notifying other threads.
      */
     void setCallback(const std::function<void(int, bool)> &cb);
 
     /**
      * @brief Stops the signal handling thread and restores terminal settings.
      *
-     * @return true if the thread was stopped successfully, false if already stopped.
+     * Shutdown sets STOP_REQUESTED, wakes the blocked worker with SIGUSR1, and
+     * joins the worker thread before returning. This guarantees the object is
+     * no longer accessed by the worker after stop() completes.
+     *
+     * @return True if this call performed a clean stop, false if the worker was
+     *         already stopped or shutdown was already in progress
+     *
+     * @warning Because stop() always joins, it can wait as long as the worker
+     *          needs to finish any in-flight callback.
      */
     bool stop();
 
     /**
      * @brief Sets thread scheduling policy and priority for the signal thread.
      *
-     * @param schedPolicy One of SCHED_FIFO, SCHED_RR, or SCHED_OTHER.
-     * @param priority Desired priority level for the thread.
-     * @return true if the change succeeded, false otherwise.
+     * @param schedPolicy One of SCHED_FIFO, SCHED_RR, or SCHED_OTHER
+     * @param priority Desired priority level for the thread
+     * @return True if the change succeeded, false otherwise
      */
     bool setPriority(int schedPolicy, int priority);
 
     /**
      * @brief Converts a signal number to its string representation.
      *
-     * @param signum The signal number to convert.
-     * @return A string view of the signal name or "UNKNOWN" if not found.
+     * @param signum Signal number to convert
+     * @return Signal name, or "UNKNOWN" if the signal is not mapped
      */
     static std::string_view signalToString(int signum);
 
     /**
      * @brief Static map of signals to handle.
      *
-     * @details Each entry maps a signal number to:
-     * - A string view representing the signal name.
-     * - A boolean indicating if it is an "immediate" signal (requires forced shutdown).
+     * Each entry maps a signal number to its display name and whether it is
+     * considered immediate by the application.
      */
     static const std::unordered_map<int, std::pair<std::string_view, bool>> signal_map;
 
@@ -156,44 +192,44 @@ private:
     std::thread worker_thread;
 
     /**
-     * @brief Indicates if the signal loop is active.
-     * */
-    std::atomic<bool> running;
-
-    /**
-     * @brief Flag used to break the signal wait loop.
+     * @brief Current lifecycle state of the worker thread.
      */
-    std::atomic<bool> stop_requested;
+    std::atomic<SignalHandlerState> state;
 
     /**
-     * @brief Suppresses callback on dummy signal during shutdown.
+     * @brief Legacy shutdown marker retained for compatibility.
+     *
+     * This member is currently unused by the implementation.
      */
     std::atomic<bool> stopping;
 
     /**
-     * @brief User-provided signal handler callback.
+     * @brief User-provided callback executed on the worker thread.
      */
     std::function<void(int, bool)> callback;
 
     /**
      * @brief Original terminal settings for STDIN.
-     * @details Used to restore terminal state after disabling control char echo.
+     *
+     * Stored so control-character echo settings can be restored on shutdown.
      */
     termios original_termios;
 
     /**
-     * @brief Indicates whether terminal settings were successfully saved.
+     * @brief Whether original_termios contains a valid saved state.
      */
     bool termios_saved;
 
     /**
-     * @brief Set of signals to wait on (built from signal_map).
+     * @brief Cached set of handled signals built from signal_map.
      */
     sigset_t signal_set;
 
     /**
-     * @brief Internal function run by the signal handling thread.
-     * @details Waits on blocked signals and triggers callbacks or exits.
+     * @brief Worker entry point for the dedicated signal thread.
+     *
+     * The worker waits in sigwaitinfo(), dispatches the minimal callback for
+     * handled signals, and exits promptly once shutdown is requested.
      */
     void run();
 };
