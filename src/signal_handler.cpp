@@ -44,6 +44,45 @@
 #include <cstring>  // For strerror()
 #endif
 
+namespace
+{
+bool build_handled_signal_set(sigset_t &set)
+{
+    if (sigemptyset(&set) != 0)
+    {
+#ifdef DEBUG_SIGNAL_HANDLER
+        perror("sigemptyset");
+#endif
+        return false;
+    }
+
+    for (const auto &entry : SignalHandler::signal_map)
+    {
+        if (sigaddset(&set, entry.first) != 0)
+        {
+#ifdef DEBUG_SIGNAL_HANDLER
+            perror("sigaddset");
+#endif
+        }
+    }
+
+    return true;
+}
+
+bool apply_handled_signal_mask(const sigset_t &set)
+{
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0)
+    {
+#ifdef DEBUG_SIGNAL_HANDLER
+        perror("pthread_sigmask");
+#endif
+        return false;
+    }
+
+    return true;
+}
+} // namespace
+
 /**
  * @brief Mapping of handled signals to display names and immediacy flags.
  *
@@ -75,30 +114,12 @@ void block_signals()
 {
     sigset_t blockset;
 
-    if (sigemptyset(&blockset) != 0)
+    if (!build_handled_signal_set(blockset))
     {
-#ifdef DEBUG_SIGNAL_HANDLER
-        perror("sigemptyset");
-#endif
         return;
     }
 
-    for (const auto &entry : SignalHandler::signal_map)
-    {
-        if (sigaddset(&blockset, entry.first) != 0)
-        {
-#ifdef DEBUG_SIGNAL_HANDLER
-            perror("sigaddset");
-#endif
-        }
-    }
-
-    if (pthread_sigmask(SIG_BLOCK, &blockset, nullptr) != 0)
-    {
-#ifdef DEBUG_SIGNAL_HANDLER
-        perror("pthread_sigmask");
-#endif
-    }
+    (void)apply_handled_signal_mask(blockset);
 }
 
 /**
@@ -142,30 +163,14 @@ void SignalHandler::start()
         tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
     }
 
-    if (sigemptyset(&signal_set) != 0)
+    if (!build_handled_signal_set(signal_set))
     {
-#ifdef DEBUG_SIGNAL_HANDLER
-        perror("sigemptyset");
-#endif
         state.store(SignalHandlerState::STOPPED);
         return;
     }
 
-    for (const auto &entry : signal_map)
+    if (!apply_handled_signal_mask(signal_set))
     {
-        if (sigaddset(&signal_set, entry.first) != 0)
-        {
-#ifdef DEBUG_SIGNAL_HANDLER
-            perror("sigaddset");
-#endif
-        }
-    }
-
-    if (pthread_sigmask(SIG_BLOCK, &signal_set, nullptr) != 0)
-    {
-#ifdef DEBUG_SIGNAL_HANDLER
-        perror("pthread_sigmask");
-#endif
         state.store(SignalHandlerState::STOPPED);
         return;
     }
@@ -323,23 +328,19 @@ void SignalHandler::run()
     SignalHandler *local_this = this;
 
     sigset_t local_set;
-    if (sigemptyset(&local_set) != 0)
+    if (!build_handled_signal_set(local_set))
     {
-#ifdef DEBUG_SIGNAL_HANDLER
-        perror("sigemptyset");
-#endif
         local_this->state.store(SignalHandlerState::STOPPED);
         return;
     }
 
-    for (const auto &entry : signal_map)
+    // Re-apply the handled mask inside the worker itself so the signal
+    // waiter stays correct even if thread creation or later library code
+    // disturbed the inherited mask.
+    if (!apply_handled_signal_mask(local_set))
     {
-        if (sigaddset(&local_set, entry.first) != 0)
-        {
-#ifdef DEBUG_SIGNAL_HANDLER
-            perror("sigaddset");
-#endif
-        }
+        local_this->state.store(SignalHandlerState::STOPPED);
+        return;
     }
 
     while (true)
