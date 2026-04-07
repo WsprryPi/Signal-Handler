@@ -197,13 +197,6 @@ private:
     std::atomic<SignalHandlerState> state;
 
     /**
-     * @brief Legacy shutdown marker retained for compatibility.
-     *
-     * This member is currently unused by the implementation.
-     */
-    std::atomic<bool> stopping;
-
-    /**
      * @brief User-provided callback executed on the worker thread.
      */
     std::function<void(int, bool)> callback;
